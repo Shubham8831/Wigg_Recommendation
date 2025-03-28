@@ -1,106 +1,118 @@
-import cv2
-import mediapipe as mp
-import numpy as np
 import streamlit as st
-from PIL import Image
-import tempfile
+import cv2
+import numpy as np
+import os
 
-st.title("Wig Overlay App")
-st.write("Upload an image of a bald person and a wig image to see the transformation.")
+def overlay_transparent(background, overlay, x, y):
+    """
+    Overlays a transparent PNG (overlay) onto a background image at (x, y).
+    Handles cases where x or y are negative by cropping the overlay appropriately.
+    Both images should be in BGRA format.
+    """
+    bg_height, bg_width = background.shape[:2]
+    ov_height, ov_width = overlay.shape[:2]
 
-# Upload images
-bald_file = st.file_uploader("Upload a bald person's image", type=["jpg", "jpeg", "png"])
-wig_file = st.file_uploader("Upload a wig image (with transparency)", type=["png", "jpg", "jpeg"])
+    # If x or y are negative, crop the overlay and adjust x, y
+    if x < 0:
+        overlay = overlay[:, -x:]
+        ov_width = overlay.shape[1]
+        x = 0
+    if y < 0:
+        overlay = overlay[-y:, :]
+        ov_height = overlay.shape[0]
+        y = 0
 
-def load_image(file) -> np.ndarray:
-    # Open image using PIL then convert to OpenCV BGR format.
-    image = Image.open(file).convert('RGB')
-    return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    # If the overlay is completely outside the background, return the original background
+    if x >= bg_width or y >= bg_height:
+        return background
 
-@st.cache(allow_output_mutation=True)
-def get_face_bbox(image):
-    mp_face_mesh = mp.solutions.face_mesh
-    with mp_face_mesh.FaceMesh(static_image_mode=True) as face_mesh:
-        # MediaPipe expects an RGB image.
-        results = face_mesh.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-        if not results.multi_face_landmarks:
-            return None
-        
-        # Use the first detected face
-        face_landmarks = results.multi_face_landmarks[0]
-        h, w, _ = image.shape
-        landmark_points = [(int(lm.x * w), int(lm.y * h)) for lm in face_landmarks.landmark]
-        landmark_array = np.array(landmark_points)
-        x_min, y_min = landmark_array.min(axis=0)
-        x_max, y_max = landmark_array.max(axis=0)
-        return (x_min, y_min, x_max, y_max)
+    # Calculate the region of interest dimensions
+    roi_width = min(ov_width, bg_width - x)
+    roi_height = min(ov_height, bg_height - y)
 
-def overlay_wig(bald_img, wig_img):
-    bbox = get_face_bbox(bald_img)
-    if bbox is None:
-        st.error("No face detected in the image!")
-        return bald_img
-    x_min, y_min, x_max, y_max = bbox
-    face_width = x_max - x_min
+    # If ROI dimensions are invalid, return background
+    if roi_width <= 0 or roi_height <= 0:
+        return background
 
-    # Set wig width 1.5x the face width and adjust height to maintain aspect ratio.
-    wig_width = int(1.5 * face_width)
-    wig_height = int(wig_img.shape[0] * (wig_width / wig_img.shape[1]))
-    
-    wig_resized = cv2.resize(wig_img, (wig_width, wig_height), interpolation=cv2.INTER_AREA)
-    
-    # Center wig horizontally and position it above the face.
-    center_x = x_min + face_width // 2
-    top_y = y_min - wig_height
-    start_x = center_x - wig_width // 2
+    overlay_crop = overlay[0:roi_height, 0:roi_width]
+    overlay_img = overlay_crop[..., :3]     # BGR channels
+    mask = overlay_crop[..., 3:] / 255.0      # Alpha channel normalized
 
-    # Convert bald image to BGRA for alpha blending.
-    overlay_img = cv2.cvtColor(bald_img, cv2.COLOR_BGR2BGRA)
+    # Extract the corresponding region from the background
+    background_roi = background[y:y+roi_height, x:x+roi_width, :3]
+    blended = (background_roi * (1 - mask) + overlay_img * mask).astype(np.uint8)
+    background[y:y+roi_height, x:x+roi_width, :3] = blended
 
-    end_x = start_x + wig_width
-    end_y = top_y + wig_height
+    return background
 
-    # Adjust region if wig goes out of image bounds.
-    if start_x < 0:
-        wig_resized = wig_resized[:, abs(start_x):]
-        start_x = 0
-    if top_y < 0:
-        wig_resized = wig_resized[abs(top_y):, :]
-        top_y = 0
-    if end_x > overlay_img.shape[1]:
-        wig_resized = wig_resized[:, :overlay_img.shape[1]-start_x]
-    if end_y > overlay_img.shape[0]:
-        wig_resized = wig_resized[:overlay_img.shape[0]-top_y, :]
+def main():
+    st.title("Put a Wig on a Bald Man!")
+    st.write(
+        "1. Upload an image of a bald man.\n"
+        "2. The app will detect the face.\n"
+        "3. The wig will be placed automatically on the head.\n"
+        "4. Enjoy the new look!"
+    )
 
-    # Ensure wig image has alpha channel
-    if wig_resized.shape[2] == 3:
-        wig_resized = cv2.cvtColor(wig_resized, cv2.COLOR_BGR2BGRA)
-    
-    # Extract region of interest.
-    roi = overlay_img[top_y:top_y+wig_resized.shape[0], start_x:start_x+wig_resized.shape[1]]
-    
-    alpha_wig = wig_resized[:, :, 3] / 255.0
-    alpha_bg = 1.0 - alpha_wig
-    
-    # Blend each channel.
-    for c in range(0, 3):
-        roi[:, :, c] = (alpha_wig * wig_resized[:, :, c] + alpha_bg * roi[:, :, c])
-    
-    overlay_img[top_y:top_y+wig_resized.shape[0], start_x:start_x+wig_resized.shape[1]] = roi
-    
-    # Convert back to BGR format.
-    result = cv2.cvtColor(overlay_img, cv2.COLOR_BGRA2BGR)
-    return result
+    # Load the wig PNG with transparency from the local file.
+    wig_path = "4.png"
+    if not os.path.exists(wig_path):
+        st.error("Could not find 'wig.png'. Please place your wig image in the same directory.")
+        return
 
-if bald_file and wig_file:
-    # Load images
-    bald_img = load_image(bald_file)
-    # For wig, if the uploaded file is a jpg without transparency, it still works but may not blend as expected.
-    wig_file_bytes = np.asarray(bytearray(wig_file.read()), dtype=np.uint8)
-    wig_img = cv2.imdecode(wig_file_bytes, cv2.IMREAD_UNCHANGED)
-    
-    result_img = overlay_wig(bald_img, wig_img)
-    
-    # Convert final image to RGB for displaying with Streamlit.
-    result_img_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
-    st.image(result_img_rgb, caption="Output with Wig", use_column_width=True)
+    wig = cv2.imread(wig_path, cv2.IMREAD_UNCHANGED)
+    if wig is None or wig.shape[2] != 4:
+        st.error("Error loading wig.png. Ensure it is a valid PNG with an alpha channel.")
+        return
+
+    # File uploader for the bald man image
+    uploaded_file = st.file_uploader("Upload a bald man image (jpg, jpeg, png)", type=["jpg", "jpeg", "png"])
+    if uploaded_file is not None:
+        file_bytes = np.frombuffer(uploaded_file.read(), np.uint8)
+        img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            st.error("Error reading the image. Please try another image file.")
+            return
+
+        # Convert the image to BGRA to support alpha blending
+        background = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2BGRA)
+
+        # Detect face using Haar Cascade
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        gray = cv2.cvtColor(background, cv2.COLOR_BGRA2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+
+        if len(faces) == 0:
+            st.warning("No face detected. Try another image or adjust detection parameters.")
+            st.image(cv2.cvtColor(background, cv2.COLOR_BGRA2RGB), caption="Original Image (No face found).")
+        else:
+            # Use the first detected face
+            (x, y, w, h) = faces[0]
+
+            # Determine the wig size (e.g., 1.2 times the face width)
+            wig_width = int(1.2 * w)
+            wig_height = int(wig.shape[0] * (wig_width / wig.shape[1]))
+            wig_resized = cv2.resize(wig, (wig_width, wig_height), interpolation=cv2.INTER_AREA)
+
+            # Calculate the position for the wig: shift above the face and slightly to the left
+            wig_x = x - int(0.1 * w)
+            wig_y = y - int(0.4 * h)
+
+            # Overlay the wig onto the background image
+            result = overlay_transparent(background.copy(), wig_resized, wig_x, wig_y)
+
+            # Display the result in Streamlit
+            st.image(cv2.cvtColor(result, cv2.COLOR_BGRA2RGB), caption="Result with Wig")
+
+            # Provide a download option for the final image
+            result_bgr = cv2.cvtColor(result, cv2.COLOR_BGRA2BGR)
+            _, encoded_img = cv2.imencode(".png", result_bgr)
+            st.download_button(
+                label="Download Result",
+                data=encoded_img.tobytes(),
+                file_name="bald_man_with_wig.png",
+                mime="image/png"
+            )
+
+if __name__ == "__main__":
+    main()
